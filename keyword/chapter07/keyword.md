@@ -383,3 +383,255 @@
     Hibernate 자체가 캐시 저장소를 직접 구현하기 보다는 외부 솔루션을 연동해 사용한다. → 최근 분산 환경에선 **Redis**나 **Hazelcast** 등의 **2차 캐시 프로바이더**로 많이 연동한다.
 
 ---
+- 배치 사이즈
+    
+    > 연관된 데이터를 조회할 때 쿼리를 매번 하나씩 날리지 않고, 지정한 개수만큼 `IN` 절을 사용해 한 번에 묶어서 조회하는 기능이다.
+    > 
+    
+    **[작동원리]**
+    
+    Team(1) 대 Member(N)의 관계를 예로 들면, 화면에 팀 10개를 보여주려고 할 때
+    
+    - **Batch Size가 없는 경우**
+    
+    반복문을 돌며 연관된 회원들을 조회하면, 각 팀의 ID를 조건으로 하는 쿼리가 10번 각각 실행된다.
+    
+    ```sql
+    SELECT * FROM member WHERE team_id = 1;
+    SELECT * FROM member WHERE team_id = 2;
+    ...
+    SELECT * FROM member WHERE team_id = 10;
+    ```
+    
+    - **Batch Size를 10으로 설정했을 때**
+    
+    Hibernate는 반복문이 시작되는 순간 뒤이어 조회될 팀들의 ID까지 미리 파악하여 `IN` 절에 묶어 하나의 쿼리로 날린다.
+    
+    ```sql
+    SELECT * FROM member WHERE team_id IN (1,2,3,4,5,6,7,8,9,10);
+    // 단 1번 실행
+    ```
+    
+    **[Batch Size 설정 방법]**
+    
+    - **글로벌 설정**
+    
+    애플리케이션 전체의 모든 지연 로딩에 배치 사이즈를 적용한다.
+    
+    ```yaml
+    # application.yaml
+    spring:
+    	jpa:
+    		properties:
+    			hibernate:
+    				default_batch_fetch_size: 100 # 보통 100 또는 500을 가장 많이 쓴다.
+    ```
+    
+    - **개별 엔티티 설정**
+    
+    특정 연관 관계에만 다른 사이즈를 적용하고 싶을 때 사용한다.
+    
+    ```java
+    @Entity
+    public class Team {
+        @Id @GeneratedValue
+        private Long id;
+    
+        @BatchSize(size = 50) // 이 연관관계에만 50 적용
+        @OneToMany(mappedBy = "team")
+        private List<Member> members = new ArrayList<>();
+    }
+    ```
+    
+    **[Fetch Join과의 차이점]**
+    
+    기존에  배운 Fetch Join으로 풀지 않고 Batch Join을 고려하는 이유는 Fetch Join이 해결하지 못하는 단점을 해결해주기 때문이다.
+    
+    - **컬렉션 페이징(Paging) 문제**
+    
+    JPA에서 일대다(1:N) 관계의 컬렉션을 Fetch Join 하면서 페이징 처리를 시도하면, Hibernate는 모든 데이터를 **메모리로 전부 읽어와서 페이징을 수행한다는 단점**을 가진다. Out of Memory 문제
+    
+    → `Team` 만 페이징 쿼리로 DB에서 끊어 가져온 뒤, 연관된 `Member` 들은 Batch Size를 통해 `IN` 절로 묶어 가져오면 안전하게 페이징과 N+1을 모두 해결할 수 있다.
+    
+    - **둘 이상의 컬렉션 Fetch Join 가능**
+    
+    JPA는 2개 이상의 컬렉션을 동시에 Fetch Join하면 데이터가 기하급수적으로 늘어나는 `MultipleBagFetchException` 이 발생하여 애플케이션 구동이 안 된다. 이때 하나는 Fetch Join을 쓰고, 나머지는 Batch Size로 처리하면 해결된다.
+    
+- transform - groupBy
+    
+    > **변환(transform)**과 **그룹화(GroupBy)**는 데이터베이스에서 조회한 엔티티 목록을 client에 반환할 DTO나 API 스펙에 맞게 가공할 때 사용하는 패턴이다.
+    > 
+    
+    > 주로 Java Stream API또는 QueryDSL의 Transform 기능을  사용하여 구현한다.
+    > 
+    
+    **[Java Stream API 방법]**
+    
+    DB에서 엔티티 리스트를 다 가져온 뒤, 서버 메모리 상에서 Stream API를 이용해 그룹화와 변환을 처리하는 방식
+    
+    **<예시>**
+    
+    하나의 Order에 여러 개의 주문 상품(OrderItem)이 포함되어 있다. DB에서 OrderItem들을 조회한 후, OrderId별로 그룹화하면서 동시에 엔티티를 DTO로 변환하려고 한다.
+    
+    ```java
+    // DB에서 조회해온 주문 상품 엔티티 리스트
+    List<OrderItem> orderItems = orderItemRepository.findAll();
+    
+    // groupBy & transform 수행
+    Map<Long, List<OrderItemDto>> orderMap = orderItems.stream()
+        .collect(Collectors.groupingBy(
+            OrderItem::getOrderId, // GroupBy 기준: 주문 ID (Key)
+            Collectors.mapping(    // Transform: 엔티티를 DTO로 변환 (Value)
+                item -> new OrderItemDto(item.getId(), item.getItemName(), item.getPrice()),
+                Collectors.toList()
+            )
+        ));
+    ```
+    
+    - `Collectors.groupingBy` : `orderId` 으로 그룹을 묶어 Map의 Key를 생성한다.
+    - `Collectors.mapping` : Stream의 `map()`과 같은 역할으로, 그룹화하는 대상 엔티티들을 원하는 형태(DTO)로 변환(Transform)하여 List로 수집한다.
+    
+    **[QueryDSL의 `transform()` 방법]**
+    
+    DB에서 조인된 평면 데이터 구조를 중복없이 깔끔한 객체 그래프(Map 또는 DTO 구조)로 한 번에 변환할 수 있다.
+    
+    **<예시>**
+    
+    ```java
+    import static com.querydsl.core.group.GroupBy.*;
+    
+    Map<Long, OrderResponseDto> result = queryFactory
+        .from(order)
+        .join(order.orderItems, orderItem)
+        .transform(
+            groupBy(order.id).as(new QOrderResponseDto(
+                order.id,
+                order.orderDate,
+                // 그룹화하는 동시에 내부 컬렉션을 DTO로 변환(Transform)하여 리스트로 수집
+                list(new QOrderItemDto(orderItem.id, orderItem.itemName, orderItem.price))
+            ))
+        );
+    ```
+    
+    - `transform(groupBy(...).as(...))`: Querydsl 내부적으로 결과셋을 순회하며 `order.id`가 같은 행들을 하나로 묶어준다.
+    - `list(...)`: 묶인 그룹 내에서 N에 해당하는 `orderItem` 데이터들을 `OrderItemDto`로 즉시 변환하여 리스트에 담아준다.
+    
+    - **장점**: 개발자가 직접 Stream으로 맵을 돌리며 가공할 필요 없이, 쿼리 실행 결과 자체를 완전히 구조화된 DTO 형태로 받아볼 수 있어 코드가 깔끔하다.
+    
+     **[Spring Boot 레이어 아키텍처]**
+    
+    - **Transform의 위치**: DB 엔티티가 영속성 컨텍스트를 벗어나 Controller나 클라이언트에게 그대로 노출되면 보안 문제가 생길 수 있어, **Service 레이어 뒷단이나 Querydsl 조회 시점에 DTO로 Transform하는 것이 정석**이다.
+    
+    - **GroupBy의 메모리 고려**: Java Stream을 이용한 `groupBy`는 DB 데이터를 WAS 메모리에 다 올려놓고 가공하는 방식이다. 만약 데이터가 수백만 건 단위로 너무 많다면 WAS 메모리에 부하가 가므로, DB 레벨에서 쿼리 튜닝을 하거나 페이징 처리를 먼저 수행한 후 소량의 데이터에만 적용해야 한다.
+    
+- order by null
+    
+    > MySQL 환경에서 과거에 성능 최적화를 사용했던 기법이다.
+    > 
+    
+    **[MySQL에서 성능 최적화]**
+    
+    MySQL 5.7 이하에서는 `GROUP BY`  절을 사용하면 그룹화할 컬럼을 기준으로 내부적으로 자동으로 **오름차순(`ASC`) 정렬**을 수행했다.
+    
+    → 정렬 연산으로 인해 데이터가 많을 경우 성능 저하로 이어졌다.
+    
+    **<해결책>**
+    
+    정렬이 필요없고 단순히 그룹화만을 원할 때, 쿼리 끝에 `ORDER BY NULL`을 붙여 정렬을 방지한다.
+    
+    ```sql
+    SELECT department_id, COUNT(*) 
+    FROM employees 
+    GROUP BY department_id
+    ORDER BY NULL; -- 암묵적 정렬을 막아 정렬 연산을 방지한다.
+    ```
+    
+    **[현대 MySQL에서의 변화]**
+    
+    MySQL 8.0 버전부터는 `GROUP BY` 의 암묵적 정렬 기능이 제거 되었다. 과거와 달리 그룹화만 수행하므로 최신 버전 MySQL 환경에서는 성능 최적화 목적의 `ORDER BY NULL`을 명시할 필요가 없다.
+    
+- 카테시안 곱
+    
+    > 카테시안 곱은 수학의 집합론에서 나온 개념, DB 환경에서 두 테이블의 **모든 행(row)**을 제한 조건 없이 **수평으로 전부 결합**하는 조인 방식
+    > 
+    
+    > SQL 문법에서는 `CROSS JOIN`, **교차 조인으로** 조건문(ON, WHERE)을 걸지 않고 조인 수행하면 발생한다.
+    > 
+    
+    **[연산 예시]**
+    
+    테이블 A의 행 개수가 M개이고, 테이블 B의 행 개수가 N개라면 카테시안 곱의 결과는 M*N이 된다.
+    
+    **[발생 상황]**
+    
+    - **실수로 조건문을 누락한 경우**
+    
+    `WHERE`절에 JOIN 조건을 누락하면 카테시안 곱이 발생한다.
+    
+    ```sql
+    -- 위험한 쿼리 예시
+    SELECT * 
+    FROM orders, members; -- 조인 조건(ON 이나 WHERE)이 없다.
+    ```
+    
+    → DB 서버의 CPU와 메모리가 감당할 수 없는만큼 데이터가 생성되어 서비스가 먹통이 될 수 있다.
+    
+    - **JPA/Hibernate에서의 카테시안 곱 (Fetch Join 중복)**
+    
+    하나의 엔티티가 **둘 이상의 일대다(1:N) 컬렉션 자식 관계**를 가지고 있을 때, 이를 모두 `Fetch Join`하려고 하면 Hibernate는 내부적으로 카테시안 곱 쿼리를 날린다.
+    
+    데이터가 무수히 뻥튀기되는 결과가 초래되며, JPA는 이를 감지하고 애플리케이션 구동 시점에 `MultipleBagFetchException`이라는 에러를 던지며 거부한다.
+    
+    - **의도적인 사용**
+        - 테스트 데이터 벌크 생성: DB 부하 테스트를 위해 테이블 몇 개를 묶어 많은 더미 데이터를 한 번에 생성
+        - 모든 가능한 조합 산출: 모든 조합을 생성하기 위한 사용
+    
+- MultipleBagFetchException
+    
+    > JPA/Hibernate 환경에서 둘 이상의 **일대다 컬렉션 관계**를 한 번에 **즉시 로딩(Fetch Join)**하려고 할 때 발생하는 대표적인 예외이다.
+    > 
+    
+    **[원인]**
+    
+    JPA에서 **Bag**란 “중복을 허용하고 순서가 없는 컬렉션”인 **List 타입**을 의미하는데, 하나의 상위 엔티티가 2개 이상의 자식 List 컬렉션을 가지고 있고, 성능 최적화를 위해 둘 다 Fetch Join하려고 할 때 발생한다.
+    
+    **[해결 방법]**
+    
+    - **default_batch_fetch_size 설정**
+    
+    1개 혹은 둘 다 Fetch Join을 하지 않고 지연 로딩으로 둔 채 글로벌 배치 사이즈 설정을 주는 것이다.
+    
+    Fetch Join으로 묶어서 1번의 쿼리로 가져오고 그 후 컬렉션을 루프 돌며 사용할 때, **Batch Size** 기능 덕분에 `IN` 절로 묶여서 단 1번의 추가 쿼리로 조회된다.
+    
+    ```yaml
+    spring:
+      jpa:
+        properties:
+          hibernate:
+            default_batch_fetch_size: 100
+    ```
+    
+    - **컬렉션 타입을 Set으로 변경**
+    
+    중복을 허용하지 않는 자료구조를 사용하여 Hibernate가 카테시안 곱의 결과에서 중복을 걸러낸다.
+    
+    ```java
+    @OneToMany(mappedBy = "post")
+    private Set<Comment> comments = new LinkedHashSet<>();
+    
+    @OneToMany(mappedBy = "post")
+    private Set<Tag> tags = new LinkedHashSet<>();
+    ```
+    
+    에러는 막을 수 있지만, DB레벨에서 카테시안 곱이 발생하는 근본적인 비효율은 변하지 않는다.
+    
+    - **QueryDSL 등으로 쿼리 분리**
+    
+    조인 쿼리를 한 번에 다 묶지 않고 쿼리를 2~3번으로 쪼개서 가져온 뒤 메모리상에서 조합하는 방법
+    
+    **<예시>**
+    
+    1. Post 목록을 먼저 조회한다.
+    2. 조회된 Post ID들을 뽑아서 Comment를 WEHRE ~ IN 절을 사용해서 따로 조회한다.
+    3. 똑같이 Tag도 IN 절로 따로 조회한다.
+    4. transform - groupBy나 Map을 활용해 메모리에서 조립한다.
